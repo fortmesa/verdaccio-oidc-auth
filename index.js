@@ -168,15 +168,17 @@ class TrustedIssuer {
   }
 
   // Discovery-derived algorithms can legitimately change over time (the
-  // issuer rotates key types, adds a curve, etc.) with zero warning -- logged
-  // once per distinct result so an operator has something to grep for if
-  // behavior shifts. Pure observability, not enforcement: SAFE_ALGS is what
-  // enforces, and it holds regardless of whether anyone reads this line.
+  // issuer rotates key types, adds a curve, etc.), logged once per distinct
+  // result so an operator has something to grep for if behavior shifts.
+  // Pure observability, not enforcement -- SAFE_ALGS is what enforces, and
+  // it holds regardless of whether anyone reads this line or what level
+  // it's at -- so this is debug, not warn, whether it's the first
+  // resolution or a later change from a previously-seen one.
   _logAlgorithmsIfChanged(algorithms) {
     const key = algorithms.join(',');
     if (key === this._loggedAlgorithmsKey) return;
     this._loggedAlgorithmsKey = key;
-    this.logger.warn(
+    this.logger.debug(
       {issuer: this.id, algorithms},
       'oidc-auth: issuer @{issuer} trusted signing algorithms resolved via OIDC discovery: @{algorithms}',
     );
@@ -254,7 +256,7 @@ class TrustedIssuer {
         throw err;
       }
       this._lastDiscoveryRefreshAt = Date.now();
-      this.logger.warn(
+      this.logger.debug(
         {issuer: this.id, err: err.code || err.name || err.message},
         'oidc-auth: re-running OIDC discovery after JWKS resolution failure',
       );
@@ -406,7 +408,7 @@ class OidcAuthMiddleware {
         .verify(token)
         .then(({remoteUser, expiresAt}) => {
           this.jwtCache.set(token, remoteUser, expiresAt);
-          this.logger.warn(
+          this.logger.info(
             {issuer: issuer.id, user: remoteUser.name},
             'oidc-auth: authenticated CI identity',
           );

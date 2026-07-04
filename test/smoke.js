@@ -10,7 +10,7 @@ const http = require('node:http');
 const assert = require('node:assert/strict');
 const {TrustedIssuer, OidcAuthMiddleware} = require('../index.js');
 
-const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
+const NOOP_LOGGER = {warn() {}, error() {}, info() {}, debug() {}};
 const AUDIENCE = 'https://npmjs.dev.fort.blue';
 
 async function startMockIssuer() {
