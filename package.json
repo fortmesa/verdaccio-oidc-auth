@@ -1,0 +1,41 @@
+{
+  "name": "@fortmesa/verdaccio-oidc-auth",
+  "version": "1.0.0",
+  "description": "Verdaccio middleware plugin: verifies CI/CD platform OIDC ID tokens against their public JWKS and maps trusted claims to per-repository Verdaccio identities/groups",
+  "license": "MIT",
+  "repository": "fortmesa/verdaccio-oidc-auth",
+  "homepage": "https://github.com/fortmesa/verdaccio-oidc-auth#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "verdaccio",
+    "verdaccio-plugin",
+    "npm-registry",
+    "oidc",
+    "openid-connect",
+    "ci-cd-authentication"
+  ],
+  "main": "index.js",
+  "packageManager": "yarn@4.17.0",
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "prepare": "husky",
+    "test": "node test/smoke.js"
+  },
+  "lint-staged": {
+    "**/*.{js,yml,yaml,json,md}": [
+      "prettier --write"
+    ]
+  },
+  "dependencies": {
+    "jose": "^6.0.0"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.8",
+    "prettier": "^3.3.3"
+  }
+}

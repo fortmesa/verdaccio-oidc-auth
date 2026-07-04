@@ -1,0 +1,424 @@
+'use strict';
+
+// Manual smoke test -- this repo has no test framework/build step for its
+// plugins, but signature-verification code has no other safety net. Run with:
+//   node verdaccio-oidc-auth/test/smoke.js
+// Spins up a throwaway RSA keypair + a local fake OIDC issuer (discovery +
+// JWKS endpoints) and exercises the accept/reject paths against it.
+
+const http = require('node:http');
+const assert = require('node:assert/strict');
+const {TrustedIssuer, OidcAuthMiddleware} = require('../index.js');
+
+const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
+const AUDIENCE = 'https://npmjs.dev.fort.blue';
+
+async function startMockIssuer() {
+  const jose = await import('jose');
+
+  async function generateSigningKey() {
+    const {publicKey, privateKey} = await jose.generateKeyPair('RS256');
+    const jwk = await jose.exportJWK(publicKey);
+    jwk.kid = await jose.calculateJwkThumbprint(jwk);
+    jwk.alg = 'RS256';
+    jwk.use = 'sig';
+    return {jwk, privateKey};
+  }
+
+  // Keys are served at a version-numbered path (/jwks-v0, /jwks-v1, ...) and
+  // discovery always points at whichever version is "current" -- rotate()
+  // simulates a provider moving its JWKS to a new location, not just
+  // rotating which keys live at a fixed URL (jose already handles that case
+  // on its own; these tests are specifically for the location-change case).
+  // The pool is pre-generated so rotate() is instant -- RSA keygen is slow
+  // enough (often tens of ms) to blow past the short cooldowns the tests
+  // below assert around if it ran inline during a timing-sensitive check.
+  const keyPool = await Promise.all(
+    Array.from({length: 6}, generateSigningKey),
+  );
+  const keysByVersion = new Map([[0, keyPool[0]]]);
+  let currentVersion = 0;
+  let nextPoolIndex = 1;
+  let issuer;
+  // undefined by default -- discovery response omits
+  // id_token_signing_alg_values_supported entirely, same as a real provider
+  // that doesn't publish it. Tests can override via setAdvertisedAlgs().
+  let advertisedAlgs;
+
+  function rotate() {
+    currentVersion += 1;
+    keysByVersion.set(currentVersion, keyPool[nextPoolIndex]);
+    nextPoolIndex += 1;
+  }
+
+  function setAdvertisedAlgs(algs) {
+    advertisedAlgs = algs;
+  }
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    const versionMatch = req.url.match(/^\/jwks-v(\d+)$/);
+    if (req.url === '/.well-known/openid-configuration') {
+      const doc = {issuer, jwks_uri: `${issuer}/jwks-v${currentVersion}`};
+      if (advertisedAlgs)
+        doc.id_token_signing_alg_values_supported = advertisedAlgs;
+      res.end(JSON.stringify(doc));
+    } else if (versionMatch) {
+      const entry = keysByVersion.get(Number(versionMatch[1]));
+      if (!entry) {
+        res.statusCode = 404;
+        return res.end('{}');
+      }
+      res.end(JSON.stringify({keys: [entry.jwk]}));
+    } else {
+      res.statusCode = 404;
+      res.end('{}');
+    }
+  });
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  issuer = `http://127.0.0.1:${server.address().port}`;
+
+  async function sign(
+    claims,
+    {alg = 'RS256', expiresIn = '5m', audience = AUDIENCE} = {},
+  ) {
+    const {jwk, privateKey} = keysByVersion.get(currentVersion);
+    return new jose.SignJWT(claims)
+      .setProtectedHeader({alg, kid: jwk.kid})
+      .setIssuer(issuer)
+      .setAudience(audience)
+      .setIssuedAt()
+      .setExpirationTime(expiresIn)
+      .sign(privateKey);
+  }
+
+  return {jose, server, issuer, sign, rotate, setAdvertisedAlgs};
+}
+
+function issuerConfig(issuerUrl, overrides = {}) {
+  return {
+    id: 'mock-ci',
+    issuer: issuerUrl,
+    audience: AUDIENCE,
+    usernameTemplate: 'ci:{repository}',
+    groupTemplates: ['ci:{repository}'],
+    matchClaim: 'repository',
+    allow: [{repository: 'fortmesa/example'}],
+    ...overrides,
+  };
+}
+
+function makeIssuer(
+  issuerUrl,
+  cfgOverrides = {},
+  {discoveryCooldownSeconds = 30} = {},
+) {
+  return new TrustedIssuer(issuerConfig(issuerUrl, cfgOverrides), {
+    clockToleranceSeconds: 30,
+    discoveryCooldownSeconds,
+    logger: NOOP_LOGGER,
+  });
+}
+
+function makeMiddleware(issuerUrl, configOverrides = {}) {
+  return new OidcAuthMiddleware(
+    {
+      discoveryCooldownSeconds: 30,
+      jwtCacheTtlSeconds: 300,
+      jwtCacheMaxEntries: 1000,
+      issuers: [issuerConfig(issuerUrl)],
+      ...configOverrides,
+    },
+    {logger: NOOP_LOGGER},
+  );
+}
+
+// register_middlewares() just does app.use(handler) -- capture that handler so
+// tests can drive it directly without a real Express app.
+function captureHandler(middleware) {
+  let handler;
+  middleware.register_middlewares({use: fn => (handler = fn)}, null, null);
+  return handler;
+}
+
+function runHandler(handler, token) {
+  return new Promise((resolve, reject) => {
+    const req = {headers: token ? {authorization: `Bearer ${token}`} : {}};
+    const res = {
+      locals: {},
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        resolve({req, res: this, rejected: true, body});
+      },
+    };
+    const next = err =>
+      err ? reject(err) : resolve({req, res, rejected: false});
+    handler(req, res, next);
+  });
+}
+
+async function main() {
+  const {jose, server, issuer, sign, rotate, setAdvertisedAlgs} =
+    await startMockIssuer();
+  let passed = 0;
+
+  async function check(name, fn) {
+    try {
+      await fn();
+      passed++;
+      console.log(`PASS: ${name}`);
+    } catch (err) {
+      console.error(`FAIL: ${name}`);
+      console.error(err);
+      process.exitCode = 1;
+    }
+  }
+
+  try {
+    const trustedIssuer = makeIssuer(issuer);
+
+    await check(
+      'valid token is accepted and mapped to the right identity',
+      async () => {
+        const token = await sign({repository: 'fortmesa/example'});
+        const {remoteUser} = await trustedIssuer.verify(token);
+        assert.equal(remoteUser.name, 'ci:fortmesa/example');
+        assert.ok(remoteUser.real_groups.includes('ci:fortmesa/example'));
+        assert.ok(remoteUser.groups.includes('$authenticated'));
+      },
+    );
+
+    await check('expired token is rejected', async () => {
+      const token = await sign(
+        {repository: 'fortmesa/example'},
+        {expiresIn: '-1m'},
+      );
+      await assert.rejects(() => trustedIssuer.verify(token));
+    });
+
+    await check('wrong audience is rejected', async () => {
+      const token = await sign(
+        {repository: 'fortmesa/example'},
+        {audience: 'https://someone-else.example'},
+      );
+      await assert.rejects(() => trustedIssuer.verify(token));
+    });
+
+    await check('claim not on the allow list is rejected', async () => {
+      const token = await sign({repository: 'someone-else/not-allowed'});
+      await assert.rejects(
+        () => trustedIssuer.verify(token),
+        err => err.code === 'OIDC_NOT_ALLOWED',
+      );
+    });
+
+    await check(
+      'non-RS256 signature is rejected (alg pinned server-side)',
+      async () => {
+        const secret = new TextEncoder().encode('attacker-controlled-secret');
+        const token = await new jose.SignJWT({repository: 'fortmesa/example'})
+          .setProtectedHeader({alg: 'HS256'})
+          .setIssuer(issuer)
+          .setAudience(AUDIENCE)
+          .setIssuedAt()
+          .setExpirationTime('5m')
+          .sign(secret);
+        await assert.rejects(() => trustedIssuer.verify(token));
+      },
+    );
+
+    await check('unreachable JWKS endpoint fails closed', async () => {
+      const unreachable = makeIssuer('http://127.0.0.1:1');
+      const token = await sign({repository: 'fortmesa/example'});
+      await assert.rejects(() => unreachable.verify(token));
+    });
+
+    await check(
+      'explicit per-issuer algorithms config rejects an unsupported algorithm at construction',
+      () => {
+        assert.throws(
+          () => makeIssuer(issuer, {algorithms: ['HS256']}),
+          /unsupported algorithm 'HS256'/,
+        );
+      },
+    );
+
+    await check(
+      'explicit per-issuer algorithms config is enforced, not merged with the default',
+      async () => {
+        const esOnly = makeIssuer(issuer, {algorithms: ['ES256']});
+        const token = await sign({repository: 'fortmesa/example'}); // actually signed RS256
+        await assert.rejects(() => esOnly.verify(token));
+      },
+    );
+
+    await check(
+      'discovery-advertised algorithms are filtered through the safe list, falling back to RS256 when nothing survives',
+      async () => {
+        setAdvertisedAlgs(['HS256', 'none']);
+        try {
+          const unsafeAdvertised = makeIssuer(issuer);
+          const token = await sign({repository: 'fortmesa/example'});
+          const {remoteUser} = await unsafeAdvertised.verify(token); // still verifies: falls back to RS256
+          assert.equal(remoteUser.name, 'ci:fortmesa/example');
+        } finally {
+          setAdvertisedAlgs(undefined); // restore default for subsequent checks
+        }
+      },
+    );
+
+    const recovering = makeIssuer(issuer, {}, {discoveryCooldownSeconds: 60});
+
+    await check(
+      're-runs discovery and recovers when the provider moves its JWKS location',
+      async () => {
+        const baseline = await sign({repository: 'fortmesa/example'});
+        await recovering.verify(baseline); // caches the key set at the current location
+
+        await rotate(); // provider now serves a different key at a different jwks_uri
+        const afterMove = await sign({repository: 'fortmesa/example'});
+        const {remoteUser} = await recovering.verify(afterMove);
+        assert.equal(remoteUser.name, 'ci:fortmesa/example');
+      },
+    );
+
+    await check(
+      'does not re-run discovery again within the cooldown window',
+      async () => {
+        await rotate(); // move the location again, immediately after the last refresh
+        const token = await sign({repository: 'fortmesa/example'});
+        // `recovering` has a 60s cooldown and just refreshed a moment ago, so
+        // this must fail -- a burst of failures can't force unbounded re-discovery.
+        await assert.rejects(() => recovering.verify(token));
+      },
+    );
+
+    const fastCooldown = makeIssuer(
+      issuer,
+      {},
+      {discoveryCooldownSeconds: 0.05},
+    );
+
+    await check(
+      'cooldown blocks re-discovery immediately after a refresh',
+      async () => {
+        const baseline = await sign({repository: 'fortmesa/example'});
+        await fastCooldown.verify(baseline); // establishes the cached location, no refresh consumed yet
+
+        await rotate();
+        const afterFirstMove = await sign({repository: 'fortmesa/example'});
+        await fastCooldown.verify(afterFirstMove); // triggers and consumes the one allowed refresh
+
+        await rotate(); // move again immediately, well within the 50ms cooldown
+        const afterSecondMove = await sign({repository: 'fortmesa/example'});
+        await assert.rejects(() => fastCooldown.verify(afterSecondMove));
+      },
+    );
+
+    await check(
+      're-runs discovery again once the cooldown window has elapsed',
+      async () => {
+        await new Promise(resolve => setTimeout(resolve, 100)); // let the 50ms cooldown expire
+        const token = await sign({repository: 'fortmesa/example'}); // still the location from the previous check
+        const {remoteUser} = await fastCooldown.verify(token);
+        assert.equal(remoteUser.name, 'ci:fortmesa/example');
+      },
+    );
+
+    await check(
+      'a second request with the same token is served from cache without re-verifying',
+      async () => {
+        const middleware = makeMiddleware(issuer);
+        const handler = captureHandler(middleware);
+        const issuerInstance = middleware.issuers[0];
+        let verifyCalls = 0;
+        const originalVerify = issuerInstance.verify.bind(issuerInstance);
+        issuerInstance.verify = async (...args) => {
+          verifyCalls += 1;
+          return originalVerify(...args);
+        };
+
+        const token = await sign({repository: 'fortmesa/example'});
+
+        const first = await runHandler(handler, token);
+        assert.equal(first.req.remote_user.name, 'ci:fortmesa/example');
+        assert.equal(verifyCalls, 1);
+
+        const second = await runHandler(handler, token);
+        assert.equal(second.req.remote_user.name, 'ci:fortmesa/example');
+        assert.equal(
+          verifyCalls,
+          1,
+          'verify() must not be called again on a cache hit',
+        );
+      },
+    );
+
+    await check(
+      "a cached result never outlives the token's own expiry, even under a longer TTL",
+      async () => {
+        // clockToleranceSeconds: 0 so the token is genuinely rejected shortly
+        // after its stated exp -- the default 30s tolerance would otherwise still
+        // accept it on the re-verify below, which would make this test slow
+        // (needing a 30s+ wait) without actually exercising the cache boundary.
+        const middleware = makeMiddleware(issuer, {
+          jwtCacheTtlSeconds: 60,
+          clockToleranceSeconds: 0,
+        });
+        const handler = captureHandler(middleware);
+        const shortLivedToken = await sign(
+          {repository: 'fortmesa/example'},
+          {expiresIn: '1s'},
+        );
+
+        const first = await runHandler(handler, shortLivedToken);
+        assert.equal(first.req.remote_user.name, 'ci:fortmesa/example');
+
+        await new Promise(resolve => setTimeout(resolve, 1200)); // let the token itself expire
+
+        const second = await runHandler(handler, shortLivedToken);
+        // A 60s-TTL cache entry naively honored here would wrongly still succeed --
+        // this proves the cache is bounded by the token's own exp, not just the TTL.
+        assert.equal(second.rejected, true);
+        assert.equal(second.res.statusCode, 401);
+      },
+    );
+
+    await check(
+      'cache evicts the least-recently-used entry once its size limit is exceeded',
+      async () => {
+        const middleware = makeMiddleware(issuer, {jwtCacheMaxEntries: 2});
+        const handler = captureHandler(middleware);
+
+        const tokenA = await sign({repository: 'fortmesa/example', jti: 'a'});
+        const tokenB = await sign({repository: 'fortmesa/example', jti: 'b'});
+        const tokenC = await sign({repository: 'fortmesa/example', jti: 'c'});
+
+        await runHandler(handler, tokenA);
+        await runHandler(handler, tokenB);
+        await runHandler(handler, tokenC); // pushes the cache over its 2-entry limit
+
+        assert.equal(
+          middleware.jwtCache.get(tokenA),
+          undefined,
+          'oldest/least-recently-used entry should be evicted',
+        );
+        assert.notEqual(middleware.jwtCache.get(tokenB), undefined);
+        assert.notEqual(middleware.jwtCache.get(tokenC), undefined);
+      },
+    );
+
+    console.log(`\n${passed} check(s) passed.`);
+  } finally {
+    server.close();
+  }
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exitCode = 1;
+});
