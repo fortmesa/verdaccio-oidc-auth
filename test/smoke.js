@@ -217,6 +217,100 @@ async function main() {
     });
 
     await check(
+      'allow: entries are real minimatch globs -- a trailing "*" matches a same-scope repo',
+      async () => {
+        const wildcardIssuer = makeIssuer(issuer, {
+          allow: [{repository: 'fortmesa/*'}],
+        });
+        const token = await sign({
+          repository: 'fortmesa/verdaccio-attestations',
+        });
+        const {remoteUser} = await wildcardIssuer.verify(token);
+        assert.equal(remoteUser.name, 'ci:fortmesa/verdaccio-attestations');
+      },
+    );
+
+    await check(
+      'a "*" does not cross a "/" -- "fortmesa/*" does not match a nested path',
+      async () => {
+        const wildcardIssuer = makeIssuer(issuer, {
+          allow: [{repository: 'fortmesa/*'}],
+        });
+        const token = await sign({repository: 'fortmesa/deep/nested'});
+        await assert.rejects(
+          () => wildcardIssuer.verify(token),
+          err => err.code === 'OIDC_NOT_ALLOWED',
+        );
+      },
+    );
+
+    await check(
+      'a "*" also does not cross a ":" -- claims are free-form, not always "/"-delimited',
+      async () => {
+        const colonIssuer = makeIssuer(issuer, {
+          matchClaim: 'team',
+          usernameTemplate: 'ci:{team}',
+          allow: [{team: 'fortmesa:*'}],
+        });
+        const matching = await sign({team: 'fortmesa:platform'});
+        const {remoteUser} = await colonIssuer.verify(matching);
+        assert.equal(remoteUser.name, 'ci:fortmesa:platform');
+
+        const nested = await sign({team: 'fortmesa:platform:prod'});
+        await assert.rejects(
+          () => colonIssuer.verify(nested),
+          err => err.code === 'OIDC_NOT_ALLOWED',
+        );
+      },
+    );
+
+    await check(
+      '"**" matches every repo, crossing both "/" and ":"',
+      async () => {
+        const everythingIssuer = makeIssuer(issuer, {
+          allow: [{repository: '**'}],
+        });
+        const token = await sign({repository: 'anyone/anything'});
+        const {remoteUser} = await everythingIssuer.verify(token);
+        assert.equal(remoteUser.name, 'ci:anyone/anything');
+      },
+    );
+
+    await check(
+      'matching is case-insensitive by default, same as before minimatch',
+      async () => {
+        const token = await sign({repository: 'FortMesa/Example'});
+        const {remoteUser} = await trustedIssuer.verify(token);
+        assert.equal(remoteUser.name, 'ci:FortMesa/Example');
+      },
+    );
+
+    await check(
+      'matchCaseInsensitive: false makes matching case-sensitive',
+      async () => {
+        const caseSensitiveIssuer = makeIssuer(issuer, {
+          matchCaseInsensitive: false,
+        });
+        const token = await sign({repository: 'FortMesa/Example'});
+        await assert.rejects(
+          () => caseSensitiveIssuer.verify(token),
+          err => err.code === 'OIDC_NOT_ALLOWED',
+        );
+      },
+    );
+
+    await check(
+      'a missing/non-string claim value fails closed instead of throwing',
+      async () => {
+        const token = await sign({});
+        await assert.rejects(
+          () => trustedIssuer.verify(token),
+          err => err.code === 'OIDC_NOT_ALLOWED',
+        );
+      },
+    );
+
+    await check(
       'non-RS256 signature is rejected (alg pinned server-side)',
       async () => {
         const secret = new TextEncoder().encode('attacker-controlled-secret');

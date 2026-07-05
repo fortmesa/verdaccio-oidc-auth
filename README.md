@@ -74,7 +74,9 @@ endpoints) and exercises the accept/reject paths against it.
 
 `jose` -- the only JWT/JWKS/OIDC library this plugin uses. Loaded via dynamic
 `import()` (it's ESM-only) rather than `require()`, so it works from this
-plugin's CommonJS `index.js` on any modern Node version.
+plugin's CommonJS `index.js` on any modern Node version. `minimatch` -- `allow:`
+list matching, the same convention every other plugin in this family uses -- see
+[Matching `allow:` entries](docs/configuration.md#matching-allow-entries).
 
 ## License
 

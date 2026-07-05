@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const {minimatch} = require('minimatch');
 
 // jose is ESM-only; load it lazily via dynamic import (works from CommonJS on
 // any modern Node) rather than require(), and memoize so it's only loaded once.
@@ -69,6 +70,21 @@ const DEFAULT_LOGGED_IN_GROUPS = [
   '@authenticated',
 ];
 
+// allow: entries are matched with real minimatch -- the same convention
+// every other plugin in this family uses -- but a claim value is not a
+// package name: matchClaim is fully free-form per issuer config (GitHub's
+// `repository`, Bitbucket's opaque `repositoryUuid`, or whatever claim a
+// future issuer's own token shape happens to carry), so this can't assume
+// a package-name-like, single-delimiter structure. minimatch's `*` already
+// stops at `/` on its own; folding every `:` to `/` before matching makes
+// it stop there too, for an issuer whose claim shape delimits with `:`
+// instead of (or in addition to) `/` -- e.g. `fortmesa:verdaccio-*` blocks
+// `*` from also matching past a `:`, the same way `fortmesa/*` already
+// stops at a `/`. A value/pattern with neither character is unaffected.
+function foldMatchDelimiters(value) {
+  return value.replace(/:/g, '/');
+}
+
 class TrustedIssuer {
   constructor(cfg, {clockToleranceSeconds, discoveryCooldownSeconds, logger}) {
     this.id = cfg.id;
@@ -82,7 +98,7 @@ class TrustedIssuer {
     this.clockToleranceSeconds = clockToleranceSeconds;
     this.logger = logger;
     this.allow = (cfg.allow ?? []).map(entry =>
-      this._normalize(entry[this.matchClaim]),
+      foldMatchDelimiters(entry[this.matchClaim]),
     );
     // Mirrors jose's own default cooldown between JWKS refetches -- bounds how
     // often a flood of bad tokens can force us to re-run OIDC discovery,
@@ -113,12 +129,6 @@ class TrustedIssuer {
       }
     }
     return algorithms;
-  }
-
-  _normalize(value) {
-    return this.caseInsensitive && typeof value === 'string'
-      ? value.toLowerCase()
-      : value;
   }
 
   async _resolveJwksUri() {
@@ -215,7 +225,12 @@ class TrustedIssuer {
   }
 
   _isAllowed(claims) {
-    return this.allow.includes(this._normalize(claims[this.matchClaim]));
+    const value = claims[this.matchClaim];
+    if (typeof value !== 'string') return false;
+    const folded = foldMatchDelimiters(value);
+    return this.allow.some(pattern =>
+      minimatch(folded, pattern, {nocase: this.caseInsensitive}),
+    );
   }
 
   _verifyOptions() {

@@ -55,7 +55,8 @@ middlewares:
         matchClaim: repository # which claim is checked against `allow`
         matchCaseInsensitive: true # default true
         allow:
-          - repository: your-org/your-repo # one entry per onboarded repo
+          - repository: your-org/your-repo # exact match
+          - repository: your-org/service-* # glob -- see "Matching allow: entries" below
       - id: bitbucket-pipelines
         issuer: https://api.bitbucket.org/2.0/workspaces/your-workspace/pipelines-config/identity/oidc
         audience: 'ari:cloud:bitbucket::workspace/<workspace-uuid>'
@@ -71,6 +72,20 @@ middlewares:
 Each `issuers[]` entry is independent; the plugin throws at startup if two
 entries share the same `issuer` URL (a config mistake that would otherwise
 silently mean only the first one is ever tried).
+
+## Matching `allow:` entries
+
+Each `allow:` entry is matched against `matchClaim`'s value with real
+`minimatch` -- the same convention every other plugin in this family uses -- but
+a claim value is not a package name, and `matchClaim` is fully free-form per
+issuer (GitHub's `repository`, Bitbucket's opaque `repositoryUuid`, or whatever
+claim shape a future issuer's own tokens happen to carry), so this can't assume
+a single, package-name-like delimiter convention. `*` stops at both `/` and `:`
+-- `your-org/service-*` matches `your-org/service-a` but not
+`your-org/service-a/nested`, and the same stopping behavior applies across a `:`
+for an issuer whose claim shape delimits with one instead (or as well). `**`
+matches everything, crossing both. A claim value that's missing or not a string
+always fails the check rather than matching or throwing.
 
 ## How verification works (per request)
 
