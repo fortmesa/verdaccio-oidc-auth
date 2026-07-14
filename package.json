@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-oidc-auth",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Verdaccio middleware plugin: verifies CI/CD platform OIDC ID tokens against their public JWKS and maps trusted claims to per-repository Verdaccio identities/groups",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-oidc-auth",
