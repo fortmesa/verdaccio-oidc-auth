@@ -142,6 +142,34 @@ function captureHandler(middleware) {
   return handler;
 }
 
+// Same idea, but keeps every app.use() call in registration order --
+// register_middlewares() now registers two: the body-buffering middleware
+// (workaround for verdaccio/verdaccio#1912) first, then the existing
+// auth-check one.
+function captureHandlers(middleware) {
+  const handlers = [];
+  middleware.register_middlewares({use: fn => handlers.push(fn)}, null, null);
+  return handlers;
+}
+
+// A minimal real Readable so req.on('data'/'end') behaves like an actual
+// stream -- a plain object (like runHandler's fake req above) doesn't
+// support that, and the body-buffering middleware needs genuine stream
+// semantics to be tested meaningfully.
+function makeStreamingReq({method, headers, body}) {
+  const {Readable} = require('node:stream');
+  const req = new Readable({
+    read() {},
+  });
+  req.method = method;
+  req.headers = headers;
+  process.nextTick(() => {
+    if (body !== undefined) req.push(body);
+    req.push(null);
+  });
+  return req;
+}
+
 function runHandler(handler, token) {
   return new Promise((resolve, reject) => {
     const req = {headers: token ? {authorization: `Bearer ${token}`} : {}};
@@ -503,6 +531,192 @@ async function main() {
         );
         assert.notEqual(middleware.jwtCache.get(tokenB), undefined);
         assert.notEqual(middleware.jwtCache.get(tokenC), undefined);
+      },
+    );
+
+    // --- body-buffering middleware (workaround for verdaccio/verdaccio#1912) ---
+
+    await check(
+      'a PUT with a JSON content-type gets req.body/req._body populated by the buffering middleware, before the auth handler even runs',
+      async () => {
+        const middleware = makeMiddleware(issuer);
+        const [bufferHandler] = captureHandlers(middleware);
+
+        const payload = {versions: {'1.0.0': {version: '1.0.0'}}};
+        const req = makeStreamingReq({
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+
+        await new Promise((resolve, reject) => {
+          bufferHandler(req, {}, err => (err ? reject(err) : resolve()));
+        });
+
+        assert.equal(req._body, true);
+        assert.deepEqual(req.body, payload);
+      },
+    );
+
+    await check(
+      'a non-PUT request is left alone by the buffering middleware -- no req.body, stream untouched',
+      async () => {
+        const middleware = makeMiddleware(issuer);
+        const [bufferHandler] = captureHandlers(middleware);
+
+        const req = makeStreamingReq({
+          method: 'GET',
+          headers: {'content-type': 'application/json'},
+        });
+
+        await new Promise((resolve, reject) => {
+          bufferHandler(req, {}, err => (err ? reject(err) : resolve()));
+        });
+
+        assert.equal(req._body, undefined);
+        assert.equal(req.body, undefined);
+      },
+    );
+
+    await check(
+      'a PUT with a non-JSON content-type (the tarball-only upload route) is left alone -- never treated as JSON',
+      async () => {
+        const middleware = makeMiddleware(issuer);
+        const [bufferHandler] = captureHandlers(middleware);
+
+        const req = makeStreamingReq({
+          method: 'PUT',
+          headers: {'content-type': 'application/octet-stream'},
+          body: Buffer.from([0x1f, 0x8b, 0x00, 0x00]), // not JSON at all
+        });
+
+        await new Promise((resolve, reject) => {
+          bufferHandler(req, {}, err => (err ? reject(err) : resolve()));
+        });
+
+        assert.equal(req._body, undefined);
+        assert.equal(req.body, undefined);
+      },
+    );
+
+    await check(
+      'a PUT with a non-identity content-encoding is left alone -- declines rather than risk mishandling a compressed body',
+      async () => {
+        const middleware = makeMiddleware(issuer);
+        const [bufferHandler] = captureHandlers(middleware);
+
+        const req = makeStreamingReq({
+          method: 'PUT',
+          headers: {
+            'content-type': 'application/json',
+            'content-encoding': 'gzip',
+          },
+          body: Buffer.from('not actually valid json when read raw'),
+        });
+
+        await new Promise((resolve, reject) => {
+          bufferHandler(req, {}, err => (err ? reject(err) : resolve()));
+        });
+
+        assert.equal(req._body, undefined);
+        assert.equal(req.body, undefined);
+      },
+    );
+
+    await check(
+      'malformed JSON in the body propagates an error via next(err) rather than throwing',
+      async () => {
+        const middleware = makeMiddleware(issuer);
+        const [bufferHandler] = captureHandlers(middleware);
+
+        const req = makeStreamingReq({
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: '{not valid json',
+        });
+
+        const err = await new Promise(resolve => {
+          bufferHandler(req, {}, resolve);
+        });
+        assert.ok(err instanceof Error);
+      },
+    );
+
+    await check(
+      'end-to-end: the buffering middleware prevents the exact stream-draining race a real, unmodified Verdaccio log.js causes',
+      async () => {
+        // Mirrors @verdaccio/middleware's own log.js exactly (confirmed
+        // directly against its real, installed source): an unconditional
+        // req.on('data', ...) purely to count bytes, switching the request
+        // stream into flowing mode immediately, on every request.
+        function verdaccioLogMiddlewareMirror(req, res, next) {
+          let bytesin = 0;
+          req.on('data', chunk => {
+            bytesin += chunk.length;
+          });
+          next();
+        }
+
+        const express = require('express');
+        const bodyParser = require('body-parser');
+
+        const middleware = makeMiddleware(issuer);
+        const token = await sign({repository: 'fortmesa/example'});
+
+        const app = express();
+        app.use(verdaccioLogMiddlewareMirror);
+        middleware.register_middlewares(app, null, null); // registers the buffering middleware, then the (now-instant, cache-populating) auth check
+        const parseJson = bodyParser.json({strict: false, limit: '10mb'});
+        app.use((req, res, next) => {
+          if (req.method !== 'PUT') return next();
+          parseJson(req, res, err => {
+            if (err) return res.status(500).json({error: err.message});
+            res.status(201).json({ok: true, versions: !!req.body?.versions});
+          });
+        });
+
+        const server = await new Promise(resolve => {
+          const s = app.listen(0, () => resolve(s));
+        });
+        try {
+          const port = server.address().port;
+          const payload = JSON.stringify({
+            versions: {'1.0.0': {version: '1.0.0'}},
+            filler: 'x'.repeat(75000), // realistic publish-with-provenance size
+          });
+
+          const result = await new Promise((resolve, reject) => {
+            const req = http.request(
+              {
+                method: 'PUT',
+                hostname: 'localhost',
+                port,
+                path: '/pkg',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(payload),
+                  Authorization: `Bearer ${token}`,
+                },
+              },
+              res => {
+                let body = '';
+                res.on('data', c => (body += c));
+                res.on('end', () => resolve({status: res.statusCode, body}));
+              },
+            );
+            req.on('error', reject);
+            req.end(payload);
+          });
+
+          assert.equal(
+            result.status,
+            201,
+            `expected the publish to succeed despite log.js's own listener; got: ${result.body}`,
+          );
+          assert.ok(JSON.parse(result.body).versions);
+        } finally {
+          server.close();
+        }
       },
     );
 

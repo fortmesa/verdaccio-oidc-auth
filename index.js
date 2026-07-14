@@ -399,6 +399,75 @@ class OidcAuthMiddleware {
   }
 
   register_middlewares(app, auth, storage) {
+    // Workaround for verdaccio/verdaccio#1912 (reported 2020; a fix was
+    // once merged upstream -- commit e2f7bb2, "Set bytesin log as optional"
+    // -- but it lived in the pre-monorepo-split verdaccio codebase and was
+    // never carried into the current, separately-published
+    // @verdaccio/middleware package, so it's absent from every version this
+    // plugin actually runs against). @verdaccio/middleware's own access-log
+    // middleware attaches req.on('data', ...) unconditionally on every
+    // request purely to count bytes for the log line -- which switches the
+    // request stream into Node's flowing mode immediately. This plugin's
+    // own JWT verification below is a real, non-trivial async operation
+    // (OIDC discovery, JWKS resolution, and jose's own crypto verification,
+    // none of which this plugin should reimplement synchronously just to
+    // dodge this -- that would mean hand-rolling signature verification,
+    // a correctness/security regression far worse than the bug being
+    // worked around). Whenever that JWT check isn't already
+    // cache-satisfied (a fresh token -- the common case for CI, since
+    // GitHub Actions mints a new one per job run), calling next() only
+    // after it resolves opens a window where the request stream can fully
+    // drain via that single log-middleware listener alone before any
+    // body-parser -- ours, another plugin's, or Verdaccio's own -- ever
+    // gets to attach its own, confirmed directly (100% reproduction against
+    // the real, unmodified log.js) to produce "stream is not readable" /
+    // "request size did not match content length" on real publishes.
+    //
+    // Rather than invent a plugin-specific signal only our own other
+    // plugins would know to look for, this reads the request body itself,
+    // synchronously as the very first thing -- before any async work at
+    // all -- and populates req.body/req._body, the exact same flags
+    // body-parser's own json middleware already sets and already checks
+    // before deciding whether to re-parse. Any later body-parser --
+    // verdaccio-security-filter's, verdaccio-attestations', Verdaccio
+    // core's own, or even an unrelated third-party plugin's, since this is
+    // body-parser's own pre-existing, widely-relied-on contract, not
+    // something invented here -- sees req._body already true and correctly
+    // uses this pre-populated req.body instead of re-reading a stream that
+    // may already be fully drained by then. Scoped to PUT requests with a
+    // JSON content-type specifically (the metadata-publish route; the
+    // separate tarball-only upload route is raw binary, never JSON, and is
+    // left alone), and skipped entirely for a compressed body (no real
+    // publish to this registry has ever sent one -- confirmed directly
+    // against live request headers -- so this only ever declines to help
+    // rather than risking mishandling a body-parser inflate case it hasn't
+    // been taught).
+    app.use((req, res, next) => {
+      const contentEncoding = (req.headers['content-encoding'] || '')
+        .trim()
+        .toLowerCase();
+      if (
+        req.method !== 'PUT' ||
+        !/json/i.test(req.headers['content-type'] || '') ||
+        (contentEncoding !== '' && contentEncoding !== 'identity')
+      ) {
+        return next();
+      }
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        try {
+          req.body = raw.length > 0 ? JSON.parse(raw.toString('utf8')) : {};
+        } catch (err) {
+          return next(err);
+        }
+        req._body = true;
+        next();
+      });
+      req.on('error', err => next(err));
+    });
+
     app.use((req, res, next) => {
       const header = req.headers.authorization;
       if (!header?.startsWith('Bearer ')) return next();
