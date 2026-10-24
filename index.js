@@ -1,13 +1,16 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const {minimatch} = require('minimatch');
 
 // jose is ESM-only; load it lazily via dynamic import (works from CommonJS on
-// any modern Node) rather than require(), and memoize so it's only loaded once.
+// any modern Node) rather than require(), and memoize so it's only loaded
+// once. A failed import isn't memoized, so the next request tries again.
 let josePromise;
 function loadJose() {
-  josePromise ??= import('jose');
+  josePromise ??= import('jose').catch(err => {
+    josePromise = undefined;
+    throw err;
+  });
   return josePromise;
 }
 
@@ -68,21 +71,42 @@ const DEFAULT_LOGGED_IN_GROUPS = [
   '$authenticated',
   '@all',
   '@authenticated',
+  'all',
 ];
 
-// allow: entries are matched with real minimatch -- the same convention
-// every other plugin in this family uses -- but a claim value is not a
-// package name: matchClaim is fully free-form per issuer config (GitHub's
-// `repository`, Bitbucket's opaque `repositoryUuid`, or whatever claim a
-// future issuer's own token shape happens to carry), so this can't assume
-// a package-name-like, single-delimiter structure. minimatch's `*` already
-// stops at `/` on its own; folding every `:` to `/` before matching makes
-// it stop there too, for an issuer whose claim shape delimits with `:`
-// instead of (or in addition to) `/` -- e.g. `fortmesa:verdaccio-*` blocks
-// `*` from also matching past a `:`, the same way `fortmesa/*` already
-// stops at a `/`. A value/pattern with neither character is unaffected.
+// A claim value is not a package name: matchClaim is fully free-form per
+// issuer config (GitHub's `repository`, Bitbucket's opaque `repositoryUuid`,
+// or whatever claim a future issuer's own token shape happens to carry), so
+// this can't assume a package-name-like, single-delimiter structure. Every
+// `:` is folded to `/` before matching, so `*` stops at either one -- e.g.
+// `fortmesa:verdaccio-*` blocks `*` from also matching past a `:`, the same
+// way `fortmesa/*` stops at a `/`. A value/pattern with neither character is
+// unaffected.
 function foldMatchDelimiters(value) {
   return value.replace(/:/g, '/');
+}
+
+// The pattern syntax allow: entries document: `**` matches anything, `*`
+// matches anything except `/` (after folding, `:` too), and every other
+// character is literal. Nothing else -- no negation, no braces, no
+// character classes -- so a pattern can never mean more than it looks like.
+function compileAllowPattern(pattern, caseInsensitive) {
+  const source = foldMatchDelimiters(pattern)
+    .split('**')
+    .map(part =>
+      part
+        .split('*')
+        .map(text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('[^/]*'),
+    )
+    .join('.*');
+  return new RegExp(`^${source}$`, caseInsensitive ? 'i' : '');
+}
+
+const TEMPLATE_PLACEHOLDER = /\{(\w+)\}/g;
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value !== '';
 }
 
 class TrustedIssuer {
@@ -97,8 +121,19 @@ class TrustedIssuer {
     this.explicitJwksUri = cfg.jwksUri;
     this.clockToleranceSeconds = clockToleranceSeconds;
     this.logger = logger;
-    this.allow = (cfg.allow ?? []).map(entry =>
-      foldMatchDelimiters(entry[this.matchClaim]),
+    this._validateConfig(cfg);
+    // Each entry is a set of claim patterns that must all match (one of the
+    // patterns given for each claim), and any one entry matching allows the
+    // token. matchClaim's key is required in every entry; any other key
+    // narrows that entry further, e.g. `sub` to tell a publish job's token
+    // from one any other job in the same repository could mint.
+    this.allow = cfg.allow.map(entry =>
+      Object.entries(entry).map(([claim, patterns]) => ({
+        claim,
+        patterns: []
+          .concat(patterns)
+          .map(pattern => compileAllowPattern(pattern, this.caseInsensitive)),
+      })),
     );
     // Mirrors jose's own default cooldown between JWKS refetches -- bounds how
     // often a flood of bad tokens can force us to re-run OIDC discovery,
@@ -107,6 +142,7 @@ class TrustedIssuer {
     this._jwks = null;
     this._jwksPromise = null;
     this._lastDiscoveryRefreshAt = 0;
+    this._refreshPromise = null;
 
     // Explicit config wins outright and is validated up front (fail loud on
     // a mistake, same as the duplicate-issuer-URL check in
@@ -118,6 +154,69 @@ class TrustedIssuer {
       : null;
     this._resolvedAlgorithms = null;
     this._loggedAlgorithmsKey = null;
+  }
+
+  // Everything verify() relies on, checked once at startup. A missing
+  // audience in particular would make jose skip the audience check, and a
+  // missing issuer would claim every token that carries no `iss` at all.
+  _validateConfig(cfg) {
+    const fail = message => {
+      throw new Error(`oidc-auth: issuer '${cfg.id}' ${message}`);
+    };
+    if (!isNonEmptyString(cfg.id)) {
+      throw new Error('oidc-auth: every issuer needs a non-empty id');
+    }
+    let issuerUrl;
+    try {
+      issuerUrl = new URL(cfg.issuer);
+    } catch {
+      fail('needs issuer set to an absolute URL');
+    }
+    if (issuerUrl.protocol !== 'https:' && issuerUrl.protocol !== 'http:') {
+      fail('needs an http(s) issuer URL');
+    }
+    const audiences = [].concat(cfg.audience ?? []);
+    if (audiences.length === 0 || !audiences.every(isNonEmptyString)) {
+      fail('needs audience set to a non-empty string or list of strings');
+    }
+    if (!isNonEmptyString(cfg.matchClaim)) {
+      fail('needs a non-empty matchClaim');
+    }
+    if (!Array.isArray(cfg.groupTemplates ?? [])) {
+      fail('needs groupTemplates to be a list');
+    }
+    const templates = [cfg.usernameTemplate, ...(cfg.groupTemplates ?? [])];
+    for (const template of templates) {
+      if (!isNonEmptyString(template)) {
+        fail(
+          'needs usernameTemplate and every groupTemplates entry to be non-empty strings',
+        );
+      }
+      if (/[{}]/.test(template.replace(TEMPLATE_PLACEHOLDER, ''))) {
+        fail(
+          `has a malformed template '${template}' -- placeholders look like {claimName}`,
+        );
+      }
+    }
+    if (!Array.isArray(cfg.allow) || cfg.allow.length === 0) {
+      fail('needs a non-empty allow list');
+    }
+    for (const entry of cfg.allow) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        fail('has an allow entry that is not a map of claim names to patterns');
+      }
+      if (!(cfg.matchClaim in entry)) {
+        fail(`has an allow entry without its matchClaim '${cfg.matchClaim}'`);
+      }
+      for (const [claim, patterns] of Object.entries(entry)) {
+        const list = [].concat(patterns);
+        if (list.length === 0 || !list.every(isNonEmptyString)) {
+          fail(
+            `has an allow entry whose '${claim}' is not a pattern or a list of patterns`,
+          );
+        }
+      }
+    }
   }
 
   _validateAlgorithms(algorithms, source) {
@@ -141,13 +240,25 @@ class TrustedIssuer {
       return this.explicitJwksUri;
     }
     const discoveryUrl = `${this.issuer.replace(/\/$/, '')}/.well-known/openid-configuration`;
-    const res = await fetch(discoveryUrl, {signal: AbortSignal.timeout(5000)});
-    if (!res.ok) {
+    // No redirects, as jose's own JWKS fetch: the document has to come from
+    // the issuer itself.
+    const res = await fetch(discoveryUrl, {
+      signal: AbortSignal.timeout(5000),
+      redirect: 'manual',
+    });
+    if (res.status !== 200) {
       throw new Error(
         `oidc discovery failed for issuer '${this.id}': HTTP ${res.status}`,
       );
     }
     const doc = await res.json();
+    // OpenID Connect Discovery requires the document's issuer to be exactly
+    // the issuer it was fetched for.
+    if (doc.issuer !== this.issuer) {
+      throw new Error(
+        `oidc discovery for issuer '${this.id}' returned issuer '${doc.issuer}', not '${this.issuer}'`,
+      );
+    }
     if (!doc.jwks_uri) {
       throw new Error(
         `oidc discovery for issuer '${this.id}' did not return a jwks_uri`,
@@ -220,16 +331,36 @@ class TrustedIssuer {
     return this._jwksPromise;
   }
 
+  // A claim a template names but the token doesn't carry (or carries as
+  // something other than a string or number) fails the token, rather than
+  // rendering as '' or '[object Object]' into an identity some ACL might
+  // match. Under case-insensitive matching the claim values are rendered in
+  // lower case: Verdaccio compares ACL entries exactly, so a token the allow
+  // list accepted as FortMesa/Example would otherwise get an identity no
+  // lower-case ACL entry names.
   _render(template, claims) {
-    return template.replace(/\{(\w+)\}/g, (_, key) => claims[key] ?? '');
+    return template.replace(TEMPLATE_PLACEHOLDER, (_, key) => {
+      const value = claims[key];
+      if (typeof value === 'string' || typeof value === 'number') {
+        const text = String(value);
+        return this.caseInsensitive ? text.toLowerCase() : text;
+      }
+      const err = new Error(
+        `issuer '${this.id}' token has no usable '${key}' claim for its identity template`,
+      );
+      err.code = 'OIDC_TEMPLATE_CLAIM_MISSING';
+      throw err;
+    });
   }
 
   _isAllowed(claims) {
-    const value = claims[this.matchClaim];
-    if (typeof value !== 'string') return false;
-    const folded = foldMatchDelimiters(value);
-    return this.allow.some(pattern =>
-      minimatch(folded, pattern, {nocase: this.caseInsensitive}),
+    return this.allow.some(entry =>
+      entry.every(({claim, patterns}) => {
+        const value = claims[claim];
+        if (typeof value !== 'string') return false;
+        const folded = foldMatchDelimiters(value);
+        return patterns.some(pattern => pattern.test(folded));
+      }),
     );
   }
 
@@ -264,24 +395,32 @@ class TrustedIssuer {
       const jwks = await this._getJwks();
       ({payload} = await jwtVerify(token, jwks, this._verifyOptions()));
     } catch (err) {
-      if (
-        NON_RETRYABLE_JWT_ERROR_CODES.has(err?.code) ||
-        this._discoveryCooldownActive()
-      ) {
-        throw err;
+      if (NON_RETRYABLE_JWT_ERROR_CODES.has(err?.code)) throw err;
+      // A refresh another request already started is waited for rather than
+      // refused by the cooldown it set: the keys it brings back may be the
+      // ones this token needs.
+      let refresh = this._refreshPromise;
+      if (!refresh) {
+        if (this._discoveryCooldownActive()) throw err;
+        this._lastDiscoveryRefreshAt = Date.now();
+        this.logger.debug(
+          {issuer: this.id, err: err.code || err.name || err.message},
+          'oidc-auth: re-running OIDC discovery after JWKS resolution failure',
+        );
+        refresh = this._getJwks({forceRefresh: true});
+        this._refreshPromise = refresh;
+        refresh.then(
+          () => (this._refreshPromise = null),
+          () => (this._refreshPromise = null),
+        );
       }
-      this._lastDiscoveryRefreshAt = Date.now();
-      this.logger.debug(
-        {issuer: this.id, err: err.code || err.name || err.message},
-        'oidc-auth: re-running OIDC discovery after JWKS resolution failure',
-      );
-      const freshJwks = await this._getJwks({forceRefresh: true});
+      const freshJwks = await refresh;
       ({payload} = await jwtVerify(token, freshJwks, this._verifyOptions()));
     }
 
     if (!this._isAllowed(payload)) {
       const err = new Error(
-        `claim '${this.matchClaim}' is not allow-listed for issuer '${this.id}'`,
+        `token claims match no allow entry for issuer '${this.id}'`,
       );
       err.code = 'OIDC_NOT_ALLOWED';
       throw err;
@@ -311,7 +450,16 @@ class TrustedIssuer {
 // raw token itself, so a verified bearer credential isn't retained verbatim
 // in memory for the cache's lifetime.
 class JwtVerificationCache {
+  // maxEntries 0 turns caching off.
   constructor({ttlMs, maxEntries}) {
+    if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new Error('oidc-auth: jwtCacheTtlSeconds must be 0 or more');
+    }
+    if (!Number.isInteger(maxEntries) || maxEntries < 0) {
+      throw new Error(
+        'oidc-auth: jwtCacheMaxEntries must be a whole number, 0 or more',
+      );
+    }
     this.ttlMs = ttlMs;
     this.maxEntries = maxEntries;
     this._entries = new Map(); // tokenHash -> { remoteUser, expiresAt }
@@ -336,17 +484,26 @@ class JwtVerificationCache {
     // that's gone longest unused, not just the one inserted longest ago.
     this._entries.delete(key);
     this._entries.set(key, entry);
-    return entry.remoteUser;
+    // A copy: Verdaccio's middlewares write to req.remote_user (its
+    // `error`, for one), and that must not change what later requests with
+    // the same token get.
+    return structuredClone(entry.remoteUser);
   }
 
   set(token, remoteUser, tokenExpiresAtMs) {
+    if (this.maxEntries === 0) return;
     // Never cache past the token's own expiry, no matter how long ttlMs is --
     // a cache is a performance shortcut, not a way to extend a token's life.
     const expiresAt = Math.min(Date.now() + this.ttlMs, tokenExpiresAtMs);
     if (expiresAt <= Date.now()) return; // already expired, or expiring immediately -- not worth caching
     const key = this._hash(token);
     this._entries.delete(key); // re-inserting moves it to the most-recently-used end
-    this._entries.set(key, {remoteUser, expiresAt});
+    // Stored as a copy for the same reason get() returns one: the caller
+    // hands remoteUser itself to the request that missed.
+    this._entries.set(key, {
+      remoteUser: structuredClone(remoteUser),
+      expiresAt,
+    });
     while (this._entries.size > this.maxEntries) {
       this._entries.delete(this._entries.keys().next().value);
     }
@@ -399,75 +556,6 @@ class OidcAuthMiddleware {
   }
 
   register_middlewares(app, auth, storage) {
-    // Workaround for verdaccio/verdaccio#1912 (reported 2020; a fix was
-    // once merged upstream -- commit e2f7bb2, "Set bytesin log as optional"
-    // -- but it lived in the pre-monorepo-split verdaccio codebase and was
-    // never carried into the current, separately-published
-    // @verdaccio/middleware package, so it's absent from every version this
-    // plugin actually runs against). @verdaccio/middleware's own access-log
-    // middleware attaches req.on('data', ...) unconditionally on every
-    // request purely to count bytes for the log line -- which switches the
-    // request stream into Node's flowing mode immediately. This plugin's
-    // own JWT verification below is a real, non-trivial async operation
-    // (OIDC discovery, JWKS resolution, and jose's own crypto verification,
-    // none of which this plugin should reimplement synchronously just to
-    // dodge this -- that would mean hand-rolling signature verification,
-    // a correctness/security regression far worse than the bug being
-    // worked around). Whenever that JWT check isn't already
-    // cache-satisfied (a fresh token -- the common case for CI, since
-    // GitHub Actions mints a new one per job run), calling next() only
-    // after it resolves opens a window where the request stream can fully
-    // drain via that single log-middleware listener alone before any
-    // body-parser -- ours, another plugin's, or Verdaccio's own -- ever
-    // gets to attach its own, confirmed directly (100% reproduction against
-    // the real, unmodified log.js) to produce "stream is not readable" /
-    // "request size did not match content length" on real publishes.
-    //
-    // Rather than invent a plugin-specific signal only our own other
-    // plugins would know to look for, this reads the request body itself,
-    // synchronously as the very first thing -- before any async work at
-    // all -- and populates req.body/req._body, the exact same flags
-    // body-parser's own json middleware already sets and already checks
-    // before deciding whether to re-parse. Any later body-parser --
-    // verdaccio-security-filter's, verdaccio-attestations', Verdaccio
-    // core's own, or even an unrelated third-party plugin's, since this is
-    // body-parser's own pre-existing, widely-relied-on contract, not
-    // something invented here -- sees req._body already true and correctly
-    // uses this pre-populated req.body instead of re-reading a stream that
-    // may already be fully drained by then. Scoped to PUT requests with a
-    // JSON content-type specifically (the metadata-publish route; the
-    // separate tarball-only upload route is raw binary, never JSON, and is
-    // left alone), and skipped entirely for a compressed body (no real
-    // publish to this registry has ever sent one -- confirmed directly
-    // against live request headers -- so this only ever declines to help
-    // rather than risking mishandling a body-parser inflate case it hasn't
-    // been taught).
-    app.use((req, res, next) => {
-      const contentEncoding = (req.headers['content-encoding'] || '')
-        .trim()
-        .toLowerCase();
-      if (
-        req.method !== 'PUT' ||
-        !/json/i.test(req.headers['content-type'] || '') ||
-        (contentEncoding !== '' && contentEncoding !== 'identity')
-      ) {
-        return next();
-      }
-      const chunks = [];
-      req.on('data', chunk => chunks.push(chunk));
-      req.on('end', () => {
-        const raw = Buffer.concat(chunks);
-        try {
-          req.body = raw.length > 0 ? JSON.parse(raw.toString('utf8')) : {};
-        } catch (err) {
-          return next(err);
-        }
-        req._body = true;
-        next();
-      });
-      req.on('error', err => next(err));
-    });
-
     app.use((req, res, next) => {
       const header = req.headers.authorization;
       if (!header?.startsWith('Bearer ')) return next();
@@ -488,9 +576,20 @@ class OidcAuthMiddleware {
       // (a real human session, or $anonymous) untouched.
       if (!issuer) return next();
 
-      issuer
-        .verify(token)
-        .then(({remoteUser, expiresAt}) => {
+      // Verification is asynchronous (discovery, the JWKS fetch, the
+      // signature check), and Verdaccio's access log has already started
+      // reading the request with req.on('data') (verdaccio/verdaccio#1912).
+      // Without a pause, a request body would stream past before any body
+      // parser is attached. Pausing until next() is what Verdaccio's own
+      // apiJWTmiddleware does around its asynchronous auth; the body is left
+      // for the real parsers, with their size limit. On a request whose body
+      // Verdaccio already parsed (6.10.6 parses before any plugin runs) the
+      // pause changes nothing.
+      // The two outcomes are separate handlers, so nothing thrown on the way
+      // through next() can turn an accepted request into a 401 as well.
+      req.pause();
+      issuer.verify(token).then(
+        ({remoteUser, expiresAt}) => {
           this.jwtCache.set(token, remoteUser, expiresAt);
           this.logger.info(
             {issuer: issuer.id, user: remoteUser.name},
@@ -498,18 +597,21 @@ class OidcAuthMiddleware {
           );
           req.remote_user = remoteUser;
           res.locals.remote_user = remoteUser;
+          req.resume();
           next();
-        })
-        .catch(err => {
+        },
+        err => {
           this.logger.warn(
             {issuer: issuer.id, err: err.code || err.name || err.message},
             'oidc-auth: rejected token for trusted issuer',
           );
+          req.resume();
           res.status(401).json({
             error: 'unauthorized',
             reason: 'oidc token verification failed',
           });
-        });
+        },
+      );
     });
   }
 }

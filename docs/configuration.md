@@ -1,62 +1,61 @@
 # Configuration reference
 
-See the [README](../README.md) for installation and a quick-start config. This
-page covers everything else in depth.
+The [README](../README.md) covers installation and a quick-start config. This
+page covers the rest.
 
 ## Why this is a `middlewares` plugin, not an `auth` plugin
 
-Verdaccio's core auth middleware (`auth.apiJWTmiddleware()`) always runs first
-and always sets `req.remote_user`. For a `Bearer` token, it tries to verify it
-as a session token _Verdaccio itself issued_, and -- this is the key fact that
-makes the design work -- **if that fails for any reason (including "this was
-signed by GitHub/Bitbucket, not us"), it does not reject the request. It
-silently sets `$anonymous` and calls `next()`.**
+Verdaccio's core auth middleware, `auth.apiJWTmiddleware()`, runs before any
+`middlewares` plugin and always sets `req.remote_user`. For a `Bearer` token it
+tries to verify a session token Verdaccio itself issued. When that fails for any
+reason, including a token GitHub or Bitbucket signed, it does not reject the
+request. It sets `$anonymous` and calls `next()`.
+`@fortmesa/verdaccio-generic-oidc`, which replaces that middleware, does the
+same for any Bearer token that carries an `iss` claim.
 
-That means a `middlewares` plugin registered to run afterward can safely:
+So a `middlewares` plugin registered after it can safely do one of two things.
+For a token that isn't from a trusted issuer it does nothing, and whatever core
+auth decided stands. For a token from a trusted issuer it verifies the token
+itself and overwrites `req.remote_user` before the ACL and route logic run.
 
-- do nothing if the token isn't from a trusted issuer (leaving whatever core
-  auth already decided -- a real human session, or anonymous -- untouched),
-- or, if it is from a trusted issuer, independently verify it and overwrite
-  `req.remote_user` before the ACL/route logic runs.
+An `auth:` plugin could implement `apiJWTmiddleware(helpers)` instead and
+replace Verdaccio's Bearer and Basic handling for every request. That would mean
+re-implementing Verdaccio's own token verification and its Basic-auth handoff to
+`authenticate()`, internal logic that isn't part of the public plugin API. As a
+`middlewares` plugin this one only adds to what is there.
 
-A more invasive alternative exists -- an `auth:`-configured plugin can implement
-`apiJWTmiddleware(helpers)`, which fully _replaces_ Verdaccio's built-in
-Bearer/Basic handling for every request. That was deliberately **not** used
-here: doing so would require re-implementing Verdaccio's own JWT-secret
-verification and Basic-auth-to-`authenticate()` delegation just to avoid
-breaking existing password-based users, duplicating internal logic that isn't
-part of Verdaccio's public plugin API. The `middlewares` approach needs none of
-that -- it's purely additive.
-
-**Consequence**: this plugin must be listed _before_ any other middleware that
-reads `req.remote_user` under `middlewares:` in `config.yaml`, so those see the
-corrected identity rather than the anonymous fallback.
+The consequence is ordering. List this plugin under `middlewares:` before any
+other middleware that reads `req.remote_user`, or those see the anonymous
+fallback instead of the CI identity.
 
 ## Full config
 
 ```yaml
 middlewares:
-  oidc-auth:
-    clockToleranceSeconds: 30 # default 30 -- allowed clock drift on exp/nbf
-    discoveryCooldownSeconds: 30 # default 30 -- see "Discovery and key caching" below
-    jwtCacheTtlSeconds: 300 # default 300 -- see "Result cache" below
-    jwtCacheMaxEntries: 1000 # default 1000 -- see "Result cache" below
+  '@fortmesa/verdaccio-oidc-auth':
+    clockToleranceSeconds: 30 # default 30, allowed clock drift on exp/nbf
+    discoveryCooldownSeconds: 30 # default 30, see "Discovery and key caching"
+    jwtCacheTtlSeconds: 300 # default 300, see "Result cache"
+    jwtCacheMaxEntries: 1000 # default 1000, see "Result cache"
     issuers:
-      - id: github-actions # free-form label, used in logs
-        issuer: https://token.actions.githubusercontent.com # must match the token's `iss` exactly
-        audience: https://your-registry.example.com # must match the token's `aud`
-        # algorithms: [RS256]      # optional -- see "Algorithm selection" below.
-        # Defaults to whatever OIDC discovery safely
-        # advertises, RS256 if nothing usable is found.
-        usernameTemplate: 'gha:{repository}' # {claim} substituted from verified payload
+      - id: github-actions # free-form label, used in logs and errors
+        issuer: https://token.actions.githubusercontent.com # must equal the token's iss
+        audience: https://your-registry.example.com # must match the token's aud
+        # algorithms: [RS256] # optional, see "Algorithm selection"
+        # jwksUri: https://... # optional, skips discovery for key lookup
+        usernameTemplate: 'gha:{repository}' # {claim} comes from the verified token
         groupTemplates:
           - 'gha:{repository}'
           - 'gha-org:{repository_owner}'
-        matchClaim: repository # which claim is checked against `allow`
+        matchClaim: repository # the claim every allow entry must name
         matchCaseInsensitive: true # default true
         allow:
-          - repository: your-org/your-repo # exact match
-          - repository: your-org/service-* # glob -- see "Matching allow: entries" below
+          - repository: your-org/your-repo
+            sub: 'repo:your-org/your-repo:environment:npmjs'
+          - repository: your-org/service-*
+            sub:
+              - 'repo:your-org/service-*:environment:npmjs'
+              - 'repo:your-org/service-*:ref:refs/tags/v*'
       - id: bitbucket-pipelines
         issuer: https://api.bitbucket.org/2.0/workspaces/your-workspace/pipelines-config/identity/oidc
         audience: 'ari:cloud:bitbucket::workspace/<workspace-uuid>'
@@ -66,255 +65,322 @@ middlewares:
           - 'bb-workspace:{workspaceUuid}'
         matchClaim: repositoryUuid
         allow:
-          - repositoryUuid: '<repo-uuid>' # Bitbucket claims are UUIDs, not slugs -- look this up once via Bitbucket's REST API
+          # Bitbucket claims are UUIDs, not slugs. Look one up once with
+          # GET /2.0/repositories/{workspace}/{repo_slug}.
+          - repositoryUuid: '<repo-uuid>'
 ```
 
-Each `issuers[]` entry is independent; the plugin throws at startup if two
-entries share the same `issuer` URL (a config mistake that would otherwise
-silently mean only the first one is ever tried).
+Each `issuers[]` entry is independent.
+
+## Startup checks
+
+The plugin refuses to start, with an error naming the issuer and the problem,
+when:
+
+- an issuer has no `id`, or an empty one;
+- `issuer` is not an absolute `http:` or `https:` URL;
+- `audience` is missing, empty, or a list that is empty or holds anything but
+  non-empty strings. Without an audience jose would skip the `aud` check, and
+  the issuer's tokens minted for any other audience would be accepted;
+- `matchClaim` is missing or empty;
+- `usernameTemplate` or a `groupTemplates` entry is missing or empty,
+  `groupTemplates` is not a list, or a template has a `{` or `}` outside a
+  `{claimName}` placeholder. A claim name is letters, digits and `_`;
+- `allow` is missing or empty, an entry is not a map of claim names to patterns,
+  an entry has no key for `matchClaim`, or a value is not a non-empty string or
+  a non-empty list of them;
+- `algorithms` names anything outside the supported set, see
+  [Algorithm selection](#algorithm-selection);
+- two issuers share an `issuer` URL;
+- `jwtCacheTtlSeconds` is not a number of 0 or more, or `jwtCacheMaxEntries` is
+  not a whole number of 0 or more.
 
 ## Matching `allow:` entries
 
-Each `allow:` entry is matched against `matchClaim`'s value with real
-`minimatch` -- the same convention every other plugin in this family uses -- but
-a claim value is not a package name, and `matchClaim` is fully free-form per
-issuer (GitHub's `repository`, Bitbucket's opaque `repositoryUuid`, or whatever
-claim shape a future issuer's own tokens happen to carry), so this can't assume
-a single, package-name-like delimiter convention. `*` stops at both `/` and `:`
--- `your-org/service-*` matches `your-org/service-a` but not
-`your-org/service-a/nested`, and the same stopping behavior applies across a `:`
-for an issuer whose claim shape delimits with one instead (or as well). `**`
-matches everything, crossing both. A claim value that's missing or not a string
-always fails the check rather than matching or throwing.
+A token is allowed when any one entry matches. An entry matches when every key
+in it matches the claim of the same name. Each value is a pattern or a list of
+patterns, and a list matches when any one of its patterns does. A claim that is
+missing, or isn't a string, fails its key.
 
-## How verification works (per request)
+The key named by `matchClaim` is required in every entry. Any other key narrows
+that entry. Existing single-key entries behave as before, and adding keys to an
+entry only ever makes it stricter.
 
-1. If there's no `Authorization: Bearer` header, no-op.
-2. Look the token up in the result cache (see "Result cache" below). On a hit,
-   jump straight to step 6 with the cached identity -- no base64 decoding, no
-   cryptographic work, nothing but a hash lookup and a timestamp comparison.
-3. Otherwise, base64-decode the token's payload segment _without verifying
-   anything_, just to read `iss`. If it doesn't match a configured issuer, no-op
-   -- the token might be a legitimate Verdaccio session token or garbage; either
-   way it's not ours to judge.
-4. If `iss` matches, run full verification via
+Patterns have two wildcards and nothing else:
+
+- `*` matches any run of characters except `/` and `:`;
+- `**` matches anything, crossing both.
+
+Every other character is literal. A leading `!` is not a negation, and braces,
+brackets, `?` and `+(...)` match themselves. Before matching, the plugin turns
+every `:` into a `/` in both the pattern and the claim, so `*` stops at either.
+A claim value is not a package name, and `matchClaim` can be any claim an issuer
+sends. GitHub uses `/`, a `sub` uses `:`, and Bitbucket uses neither.
+`your-org/service-*` matches `your-org/service-a` and not
+`your-org/service-a/nested`. `repo:your-org/*:environment:npmjs` matches one
+repository's publish environment and not `...:environment:npmjs:extra`.
+
+Matching ignores case unless `matchCaseInsensitive` is `false`.
+
+## Telling the publish job apart
+
+Every job in a GitHub Actions workflow run gets a token with the same
+`repository` claim. A release workflow's install job runs `yarn install` with
+`id-token: write`. A compromised dependency's install script there could request
+a token for the registry's audience, since the job picks the audience. An entry
+that matches `repository` alone would accept that token as a publish credential.
+
+GitHub's `sub` claim is what differs. A job that declares `environment: <name>`
+gets `sub: repo:<org>/<repo>:environment:<name>`. GitHub sets that itself, and
+it carries no branch or tag. A job without an environment gets
+`repo:<org>/<repo>:ref:<ref>`. So the publish job runs in its own environment,
+here `npmjs`, and the entry pins it:
+
+```yaml
+allow:
+  - repository: fortmesa/verdaccio-oidc-auth
+    sub: 'repo:fortmesa/verdaccio-oidc-auth:environment:npmjs'
+```
+
+The install job's token carries `...:environment:install`, a job outside any
+environment carries a `:ref:` sub, and neither matches. Give the environment a
+deployment rule for `v*.*.*` tags so only a release run gets into it.
+
+Roll it out in this order:
+
+1. Release and deploy a plugin version that reads every key of an entry.
+2. Add `environment: npmjs` to each repository's publish job and create the
+   GitHub environment.
+3. Add the `sub` pins to the registry config.
+
+The config change has to come last. Pins on a registry whose publish jobs don't
+run in the environment yet make every publish answer 401.
+
+## Identities
+
+On success the plugin renders `usernameTemplate` and each `groupTemplates` entry
+against the verified claims and builds `{name, groups, real_groups}`, the shape
+Verdaccio's own `createRemoteUser` produces. `real_groups` holds the rendered
+groups, without duplicates. `groups` adds Verdaccio's logged-in defaults:
+`$all`, `$authenticated`, `@all`, `@authenticated` and `all`.
+
+A placeholder's claim must be a string or a number. A token that lacks the
+claim, or carries an object or array there, fails with a 401 and the code
+`OIDC_TEMPLATE_CLAIM_MISSING` in the log. That way a missing claim never renders
+as an empty string or `[object Object]`.
+
+With `matchCaseInsensitive` on, claim values render in lower case. Verdaccio
+compares ACL entries exactly, so a token the allow list accepted as
+`FortMesa/Example` gets `gha:fortmesa/example`, matching a lower-case ACL entry.
+The template's literal text keeps its case. With `matchCaseInsensitive: false`,
+claims render as the token sends them.
+
+Verdaccio matches a `packages:` access or publish entry against the user name
+and against every group (`name === group || groups.includes(group)` in
+`@verdaccio/auth`). A rendered identity equal to an existing user name or group
+name gets that user's or group's access. The `gha:`, `gha-org:` and `bb:`
+prefixes in the examples keep CI identities apart from `htpasswd` names, which
+cannot contain `:`.
+
+## How verification works per request
+
+1. No `Authorization: Bearer` header: the plugin calls `next()` and changes
+   nothing.
+2. The plugin looks the token up in the result cache. On a hit it sets
+   `req.remote_user` and `res.locals.remote_user` to a copy of the cached
+   identity and calls `next()`.
+3. Otherwise it reads `iss` from the token's payload without verifying anything.
+   If the payload is unreadable or `iss` names no configured issuer, it calls
+   `next()` and changes nothing. The token may be one of Verdaccio's own, or
+   garbage, and either way it's core auth's to judge.
+4. It pauses the request (see [Request bodies](#request-bodies)) and runs
    [`jose`](https://github.com/panva/jose)'s `jwtVerify()` against that issuer's
-   JWKS (resolved via OIDC discovery --
-   `{issuer}/.well-known/openid-configuration` -> `jwks_uri`; see "Discovery and
-   key caching" below for exactly what's cached and when it's refreshed),
-   checking:
-   - signature, against the fetched public key
-   - `iss` and `aud` match exactly
-   - `exp`/`nbf` within `clockToleranceSeconds`, and `exp` must be present
-   - `alg` is one of that issuer's resolved algorithms -- **never read from the
-     token's own header**, which is what prevents an algorithm-confusion attack
-     (e.g. a token claiming `alg: HS256` signed with a guessable or public
-     value). See "Algorithm selection" below for how that set is resolved.
-5. Check the claim named by `matchClaim` against the issuer's `allow` list
-   (case-insensitive by default).
-6. On success: render `usernameTemplate`/`groupTemplates` against the verified
-   claims to build `{ name, groups, real_groups }` -- the same shape Verdaccio's
-   own internals produce for a logged-in user (`groups` includes `real_groups`
-   plus the built-in `$all`/`$authenticated`) -- store it in the result cache
-   (skipped on a cache hit, since it's already there), and overwrite
-   `req.remote_user`/`res.locals.remote_user` with it.
-7. On failure (bad signature, expired, wrong audience, claim not allow-listed,
-   JWKS endpoint unreachable): responds `401` directly, **rather than falling
-   through to anonymous**. A token that presents itself as CI auth but doesn't
-   check out should fail loudly, not silently downgrade to whatever anonymous
-   access happens to be configured.
+   JWKS. That checks the signature, an exact `iss` and `aud`, that `exp` is
+   present, `exp` and `nbf` within `clockToleranceSeconds`, and that `alg` is in
+   the issuer's resolved set. The plugin never takes `alg` from the token's
+   header, which is what stops an algorithm-confusion attack such as a token
+   claiming `HS256`.
+5. It checks the claims against `allow`.
+6. It renders the identity, stores it in the result cache, sets
+   `req.remote_user` and `res.locals.remote_user`, resumes the request and calls
+   `next()`.
+7. Any failure in steps 4 to 6 resumes the request and answers `401` with
+   `{"error": "unauthorized", "reason": "oidc token verification failed"}`. That
+   covers a bad signature, an expiry, a wrong audience, a disallowed claim, a
+   missing template claim and an unreachable JWKS or discovery endpoint. A token
+   presented as CI auth that doesn't check out fails loudly instead of dropping
+   to whatever anonymous access the registry allows.
+
+## Request bodies
+
+Verdaccio's access log calls `req.on('data')` on every request to count bytes
+(verdaccio/verdaccio#1912). That starts the body flowing at once. Verifying a
+token that isn't cached yet takes a network round trip or two, and an unpaused
+body would stream past before any parser was listening.
+
+The plugin calls `req.pause()` before that verification and `req.resume()` right
+before `next()` or the 401. Verdaccio's own `apiJWTmiddleware` does the same
+around its asynchronous auth. The plugin never reads the body, so Verdaccio's
+parsers do, with `max_body_size` and their own content-type and error handling.
+A cache hit or a request without a trusted issuer's token is never paused.
+
+This works in both middleware orders Verdaccio 6 uses. 6.7.4 parses JSON inside
+its endpoint router, after the plugins. 6.10.6 parses it before the plugins run,
+so by then the body is already read and the pause has no effect. Plugin versions
+before 1.1.0 read PUT JSON bodies themselves. That read hung every JSON PUT on
+6.10.6 and skipped `max_body_size` on 6.7.4.
 
 ## Discovery and key caching
 
-There are two independent caching layers, and they refresh for different
-reasons:
+There are two caches, and they refresh for different reasons.
 
-- **jose's own key cache** (inside `createRemoteJWKSet`, one instance per
-  issuer, bound to a single `jwks_uri`): reuses fetched keys for up to 10
-  minutes, and -- if a token shows up with a `kid` the cached set doesn't
-  recognize (ordinary key rotation at a _fixed_ location) -- refetches that same
-  URL, rate-limited to once per 30 seconds. This needs no code on our part; it's
-  `jose`'s built-in behavior.
-- **Our own discovery cache** (`TrustedIssuer._jwks`): the resolved `jwks_uri`
-  itself -- and the `createRemoteJWKSet` bound to it -- is normally cached for
-  the life of the process, resolved lazily on the first request that matches
-  that issuer. This is _not_ the same thing as key rotation: it's "what if the
-  provider's discovery document starts pointing somewhere else entirely" (an
-  infra migration on their end), which jose's per-URL cache has no way to detect
-  on its own since it never revisits the discovery document.
+jose's key cache lives inside `createRemoteJWKSet`, one per issuer, bound to one
+`jwks_uri`. It reuses fetched keys for up to 10 minutes. When a token arrives
+with a `kid` the cached set lacks, which is ordinary key rotation at a fixed
+URL, jose refetches that URL at most once per 30 seconds. jose does not follow
+redirects for the JWKS fetch and requires a 200.
 
-To handle that second case, `verify()` retries once on failure: if `jwtVerify()`
-fails with a code indicating the _key couldn't be resolved_
-(`ERR_JWKS_NO_MATCHING_KEY`, `ERR_JWKS_TIMEOUT`, `ERR_JWKS_INVALID`, or a raw
-network error) -- as opposed to a code indicating the token itself is bad
-against a correctly-resolved key (expired, wrong audience, bad signature,
-disallowed `alg`, not on the allow list) -- it re-runs OIDC discovery from
-scratch, builds a fresh `createRemoteJWKSet` against whatever `jwks_uri`
-discovery now returns, and retries verification exactly once before giving up.
-The token-is-bad codes are never retried: re-discovering wouldn't fix a forged
-signature or an expired token, and retrying on them would let anyone who knows a
-trusted issuer's name spam garbage tokens to force repeated discovery calls.
+The plugin caches the `jwks_uri` itself, and the key set bound to it, for the
+life of the process. It resolves it on the first request for that issuer by
+fetching `{issuer}/.well-known/openid-configuration` with a 5 second timeout.
+The plugin refuses the document when:
 
-That retry is itself rate-limited by `discoveryCooldownSeconds` (default 30,
-matching jose's own default), tracked per issuer. A fresh `createRemoteJWKSet`
-has no cooldown memory of its own, so without this our own retry logic would
-otherwise let a burst of bad tokens force unbounded re-discovery -- this
-cooldown is what keeps that bounded to roughly once per window, independent of
-jose's per-URL cooldown underneath it.
+- the answer is not HTTP 200. Redirects are not followed, so a 3xx counts;
+- its `issuer` is not exactly the configured `issuer`, as OpenID Connect
+  Discovery requires;
+- it has no `jwks_uri`.
+
+A configured `jwksUri` skips discovery.
+
+A provider can also move its JWKS to a new URL, which jose's per-URL cache can't
+see. So when `jwtVerify()` fails with a code that means the key couldn't be
+resolved, such as `ERR_JWKS_NO_MATCHING_KEY`, `ERR_JWKS_TIMEOUT`, a non-200 JWKS
+answer or a network error, the plugin re-runs discovery and retries verification
+once. Codes that mean the token itself is bad are never retried: expired, wrong
+claims, bad signature, disallowed `alg`, malformed. Re-discovery can't fix
+those, and retrying them would let anyone spam garbage tokens to force discovery
+calls.
+
+Re-discovery is limited to once per `discoveryCooldownSeconds` per issuer,
+default 30, matching jose's own cooldown. A fresh key set has no cooldown memory
+of its own, and this keeps a burst of bad tokens from forcing unbounded
+re-discovery. A request that fails while another request's re-discovery is still
+running waits for that one and retries with its result instead of being refused
+by the cooldown, so concurrent requests share one discovery.
 
 ## Algorithm selection
 
-`SAFE_ALGS` in the code is a hardcoded, non-configurable ceiling -- the complete
-set of signature algorithms this plugin will ever ask `jose` to verify against,
-regardless of what any config or discovery document says:
-`RS256`/`RS384`/`RS512`, `PS256`/`PS384`/`PS512`, `ES256`/`ES384`/`ES512`,
-`EdDSA`. Deliberately asymmetric-only -- a JWKS endpoint publishes _public_
-keys, so a legitimate issuer has no reason to ever sign a token verifiable as
-`HS*` over that same JWKS; an `HS*`-"signed" token can only mean someone is
-attempting the classic RSA/EC-public-key-reused-as-HMAC-secret confusion attack.
-`none` is excluded for the same reason.
+`SAFE_ALGS` in the code is a fixed ceiling, the full set of signature algorithms
+the plugin will ever ask jose to accept, whatever a config or discovery document
+says: `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`,
+`ES512` and `EdDSA`. All are asymmetric. A JWKS endpoint publishes public keys,
+so an `HS*` token checked against it can only be the attack that reuses a public
+key as an HMAC secret. `none` is out for the same reason.
 
-Per issuer, the algorithm(s) actually accepted are resolved in this order:
+For each issuer the accepted set is the first of these that applies:
 
-1. **`algorithms:` set explicitly in that issuer's config** -- validated against
-   `SAFE_ALGS` at startup; the plugin throws if it names anything outside that
-   set. Wins outright over everything below.
-2. **`jwks_uri` set explicitly** (discovery bypassed for key lookup) **and no
-   `algorithms` config** -- defaults to `[RS256]`. Discovery is never fetched
-   just to learn algorithms when it's already being bypassed for keys.
-3. **Otherwise** -- read from the issuer's own OIDC discovery document
-   (`id_token_signing_alg_values_supported`), filtered through `SAFE_ALGS`. This
-   is _not_ the same as trusting discovery outright: a discovery document
-   describes the issuer's entire capability surface (e.g. algorithms it might
-   support elsewhere for confidential clients using a shared secret), not
-   specifically what's safe for verifying a bearer ID token here -- so nothing
-   it advertises can ever add an algorithm outside `SAFE_ALGS`. It can only
-   narrow which of the already-safe algorithms this specific issuer uses.
-4. **Falls back to `[RS256]`** if that field is absent, malformed, or nothing in
-   it survives the `SAFE_ALGS` filter (e.g. an issuer that only advertises
-   `HS256`).
+1. `algorithms` in the issuer's config, checked against `SAFE_ALGS` at startup.
+2. With `jwksUri` set and no `algorithms`, `[RS256]`. Discovery is never fetched
+   only to learn algorithms.
+3. The discovery document's `id_token_signing_alg_values_supported`, filtered
+   through `SAFE_ALGS`. That list describes everything the issuer supports,
+   including shared-secret algorithms for confidential clients, so it can only
+   narrow the safe set and never add to it.
+4. `[RS256]`, when that field is absent, malformed or has nothing safe in it.
 
-The discovery-derived result is cached and refreshed in lockstep with the JWKS
-lookup itself (same `forceRefresh`, same discovery cooldown) -- it comes from
-the same discovery document, so there's no reason for it to have an independent
-cache lifetime of its own.
-
-An issuer's discovery-derived algorithm set can legitimately change over time
-(e.g. the issuer rotates to a new key type) with zero warning from the provider
--- logged at `warn`
-(`oidc-auth: issuer ... trusted signing algorithms resolved via OIDC discovery: ...`)
-once per distinct result, so an operator has something to grep for if behavior
-shifts. This is pure observability, not enforcement: `SAFE_ALGS` is what
-enforces, and it holds regardless of whether anyone reads that log line -- an
-issuer's discovery document can change unilaterally at any time no matter what
-we've recorded about it, so tracking history here wouldn't add any actual
-security value.
+The discovery-derived set refreshes with the JWKS lookup, since both come from
+the same document. The plugin logs each distinct result once, at `debug`:
+`oidc-auth: issuer ... trusted signing algorithms resolved via OIDC discovery: ...`.
+That line is for an operator grepping after behavior shifts. `SAFE_ALGS` does
+the enforcing whether or not anyone reads it.
 
 ## Result cache
 
-Everything above (discovery, JWKS fetch, signature verification, claims checks,
-allow-list check) is about resolving _one specific token_. A single CI job is
-not one request, though -- a typical `npm publish` alone means several requests
-(package metadata fetch, tarball upload, `whoami`), and the OIDC ID token in
-`.npmrc`'s `_authToken` is identical on every one of them. Re-running full
-cryptographic verification on every request for a token we already fully
-validated moments ago is pure waste, so successful results are cached and looked
-up by a SHA-512 hash of the raw token (`Map< hash, { remoteUser, expiresAt }>`,
-one instance shared across all issuers). SHA-512 over the more obvious SHA-256
-because it operates on 64-bit words -- typically faster on modern hardware
-despite the larger digest -- and there's no reason to prefer the smaller/slower
-hash for a key that's never exposed outside this process.
+A CI job sends the same token on many requests. `npm publish` alone fetches
+metadata, uploads and runs `whoami`. The plugin caches each successful result,
+keyed by a SHA-512 hash of the token, in one map shared by all issuers. The
+token itself is never stored.
 
-**Why a cache hit needs no revalidation, not just "less" revalidation**: a JWT's
-payload is exactly the bytes that were signed. Two requests bearing
-byte-identical token strings are, by construction, bearing identical
-`iss`/`aud`/`exp`/`repository`/every other claim and an already-proven-valid
-signature over those exact bytes -- none of that can have silently changed out
-from under us. The only fact that can change between "when we verified this" and
-"now" is the current time. So a cache hit does exactly one thing: compare
-`Date.now()` against the stored expiry. Nothing is decoded, no signature is
-checked, no allow-list is consulted -- there is nothing left that a second check
-could tell us that the first one didn't already prove for this exact byte
-sequence.
+A hit needs no re-check beyond the clock. A JWT's payload is exactly the signed
+bytes, so a byte-identical token carries the same claims and the same
+already-proven signature. The only thing that changes between the first
+verification and a later request is the time, so a hit compares `Date.now()`
+with the entry's expiry and nothing else.
 
-**Never held past the token's own `exp`, regardless of the configured TTL.** On
-a successful verify, the cache entry's expiry is
-`min(now + jwtCacheTtlSeconds, token's own exp)` -- so a short-lived CI token
-(GitHub/Bitbucket ID tokens are typically valid for minutes) is never kept
-"valid" by our cache for longer than the issuer itself said it should be, even
-if `jwtCacheTtlSeconds` is configured much higher. `exp` is required on every
-token (`requiredClaims: ['exp']` in the verify options) specifically so this
-bound always has something to work with.
+An entry never outlives the token. Its expiry is
+`min(now + jwtCacheTtlSeconds, the token's exp)`, and the plugin requires `exp`
+on every token so this bound always exists. `jwtCacheTtlSeconds: 0` caches
+nothing.
 
-**Bounded size, LRU eviction.** `jwtCacheMaxEntries` (default 1000) caps the
-map; once full, inserting a new entry evicts whichever cached token has gone
-longest without being seen again (tracked via `Map` insertion order -- a hit
-deletes-and-re-inserts its entry to move it to the recently-used end, so
-eviction always drops the coldest entry, not just the oldest).
+`jwtCacheMaxEntries` caps the map. When it's full, a new entry evicts the one
+that has gone longest without a hit, since a hit moves its entry to the
+recently-used end. `jwtCacheMaxEntries: 0` turns the cache off.
 
-**Keyed by a hash, not the raw token**, so a live bearer credential isn't held
-verbatim in memory for the cache's TTL -- only its SHA-512 digest is, which
-isn't reversible back into something a request could replay with.
+The cache stores a copy of the identity and hands out a copy on every hit.
+Verdaccio's middlewares write to `req.remote_user`, its `error` field for one,
+and a write on one request must not change what later requests with the same
+token get.
 
-**Known tradeoff**: revoking a specific already-issued, already-cached token
-mid-incident (e.g. "this CI run is compromised, kill it now") can't be done by
-editing `allow:` alone while the process keeps running -- the cached positive
-result stays honored until it naturally expires. This isn't new exposure
-specifically from caching, though: most Verdaccio config changes already require
-a restart to take effect at all, and a restart clears this in-memory cache along
-with everything else. Given OIDC ID tokens are already short-lived by nature,
-the realistic window this adds is small, but it's worth knowing the cache
-doesn't shrink that window to zero on its own.
+One tradeoff: editing `allow:` doesn't revoke a token that is already cached
+until the entry expires or the process restarts. Most Verdaccio config changes
+need a restart anyway, and a restart clears the cache. CI tokens live for
+minutes, so the window is short, but the cache does not make it zero.
 
-## Security properties / known limitations
+## Logging
 
-- **No secrets required** -- verification uses each platform's public JWKS, so
-  this plugin needs no client secret, private key, or stored credential on your
-  side.
-- **Fails closed on JWKS unavailability** for a matched issuer, after one
-  self-healing retry (re-run discovery, rebuild the key set, try once more --
-  see "Discovery and key caching" above). If the provider is genuinely
-  unreachable, or truly did stop serving the key that signed the token, the
-  request is rejected rather than falling through to anonymous.
-- **No replay protection.** OIDC ID tokens have no built-in single-use
-  enforcement; a leaked token is valid until its (short, platform-issued) `exp`.
-  Accepted as a residual risk for now -- no `jti` tracking is implemented.
-- **Case-insensitive claim matching** by default, so GitHub org/repo casing
-  variations and Bitbucket UUID casing don't cause spurious mismatches.
-- **Never logs raw tokens or full claim sets** -- only `{issuer, user}` on
-  success or `{issuer, err}` on failure, at `warn`.
+- `info` `oidc-auth: authenticated CI identity`, with `{issuer, user}`, on each
+  verification. Cache hits don't log.
+- `warn` `oidc-auth: rejected token for trusted issuer`, with `{issuer, err}`,
+  where `err` is the error's code, name or message.
+- `debug` when the algorithm set resolves or changes, and when a failure
+  triggers re-discovery.
+
+The plugin never logs a token or a full claim set.
+
+## Security properties and known limitations
+
+- The plugin needs no secret. Verification uses each platform's public JWKS, so
+  there is no client secret, private key or stored credential on your side.
+- It fails closed. After the one self-healing retry, an unreachable provider or
+  a key it stopped serving gets a 401, never anonymous access.
+- There is no replay protection. OIDC ID tokens aren't single-use, so a leaked
+  token works until its `exp`. The plugin keeps no `jti` record.
+- Claim matching ignores case by default, so casing differences in GitHub org
+  and repo names, or in Bitbucket UUIDs, don't cause mismatches. Identities
+  render in lower case to match.
+- The plugin buffers no request body, see [Request bodies](#request-bodies).
 
 ## Testing
 
-There's no test framework here, but this plugin does signature verification with
-no other safety net, so it ships one manual, dependency-free smoke test:
+`yarn test` runs both test files. Neither uses a test framework.
 
-```bash
-node test/smoke.js
-```
+`test/smoke.js` starts a pool of throwaway RSA keys and a local fake OIDC
+issuer, then drives `TrustedIssuer` and the middleware handler directly. Every
+rejection test checks the error code or message, so a test can't pass for the
+wrong reason. It covers:
 
-It spins up a pool of throwaway RSA keypairs and a local fake OIDC issuer
-(discovery + JWKS endpoints), then asserts: a valid token is accepted and mapped
-correctly; an expired token, a wrong-audience token, a non-allow-listed claim,
-and a non-RS256-signed token are all rejected; an unreachable JWKS endpoint
-fails closed; a simulated provider-side JWKS location change is recovered from
-via one discovery-refresh-and-retry; the discovery-refresh cooldown both blocks
-a second refresh immediately after the first and allows one again once the
-cooldown window elapses; a second request with the same token is served from the
-result cache without `verify()` being called again (proven by spying on the call
-count, not just by the response looking right); a cached result is rejected once
-the token's own `exp` passes even under a much longer configured TTL; and the
-cache evicts its least-recently-used entry once `jwtCacheMaxEntries` is
-exceeded. It also covers algorithm selection: an explicit `algorithms` config
-naming an unsupported algorithm throws at construction; an explicit `algorithms`
-config is enforced strictly rather than merged with the default (an RS256-signed
-token is rejected when an issuer is pinned to `[ES256]`); and a discovery
-document advertising only unsafe algorithms (`HS256`, `none`) still results in a
-working issuer, since that falls back to `RS256`. Run this after any change to
-`index.js` before relying on a real CI run to catch a regression.
+- tokens: valid, expired, wrong audience, signed by an unpublished key, `HS256`;
+- discovery: unreachable, an explicit `jwksUri`, an issuer mismatch, a redirect;
+- algorithm config, and discovery advertising only unsafe algorithms;
+- allow syntax: wildcards, `/` and `:` stops, literal metacharacters, case,
+  multi-key entries with a `sub` pin, pattern lists;
+- template claims that are missing, objects or numbers;
+- every startup check;
+- re-discovery after a JWKS move, its cooldown, and concurrent requests sharing
+  one discovery;
+- the result cache: hits, copies, the `exp` bound, LRU eviction and the 0
+  settings;
+- pause and resume around verification, and pass-through of requests that aren't
+  the plugin's;
+- JSON PUT and POST bodies and malformed JSON through Express, in both the 6.7.4
+  and the 6.10.6 middleware order.
 
-## Dependencies
-
-`jose` -- the only JWT/JWKS/OIDC library in this plugin. Loaded via dynamic
-`import()` (it's ESM-only) rather than `require()`, so it works from this
-plugin's CommonJS `index.js` on any modern Node version.
+`test/verdaccio.js` runs the plugin inside a real Verdaccio with API tokens
+signed as JWTs, as the deployed registry has them, and a fake GitHub-like
+issuer. A CI token's first request is a JSON PUT publish of a 96 KiB tarball.
+The test then publishes again from the cache, adds a dist-tag and reads it all
+back. It checks that the install job's token, a forged token and an expired one
+get 401, that Verdaccio's own publish rules still bind an allowed CI identity,
+and that Verdaccio's own tokens and anonymous requests pass through.
+`VERDACCIO_BIN` points it at another Verdaccio build, such as the one fm-npmjs
+deploys.
